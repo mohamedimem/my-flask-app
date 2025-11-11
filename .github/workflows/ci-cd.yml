@@ -1,0 +1,184 @@
+name: CI/CD for Flask Kubernetes App
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  release:
+    types: [published]
+
+env:
+  IMAGE_NAME: flask-app
+  CLUSTER_NAME: flask-cluster
+
+jobs:
+  # Test the application
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: [3.9, 3.10, 3.11]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-flask
+
+      - name: Lint with flake8
+        run: |
+          pip install flake8
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+          flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+
+      - name: Test with pytest
+        run: |
+          pip install pytest
+          python -m pytest tests/ -v
+
+      - name: Security scan with Bandit
+        run: |
+          pip install bandit
+          bandit -r . -f html -o bandit_report.html || true
+
+  # Build and push Docker image
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix={{branch}}-
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Deploy to Kubernetes
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Kubernetes tools
+        uses: engineerd/setup-kind@v0.6.0
+        with:
+          version: "v0.20.0"
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: "v1.28.0"
+
+      - name: Create Kind cluster
+        run: |
+          kind create cluster --name ${{ env.CLUSTER_NAME }} --config kind-cluster.yaml
+          kubectl cluster-info --context kind-${{ env.CLUSTER_NAME }}
+
+      - name: Install NGINX Ingress Controller
+        run: |
+          kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml
+          kubectl wait --namespace ingress-nginx \
+            --for=condition=ready pod \
+            --selector=app.kubernetes.io/component=controller \
+            --timeout=120s
+
+      - name: Deploy application
+        run: |
+          # Apply Kubernetes manifests
+          kubectl apply -f k8s/configmap.yaml
+          kubectl apply -f k8s/secret.yaml
+          kubectl apply -f k8s/deployment.yaml
+          kubectl apply -f k8s/service.yaml
+          kubectl apply -f k8s/ingress.yaml
+
+          # Wait for deployment to be ready
+          kubectl wait --for=condition=ready pod -l app=flask-app --timeout=180s
+
+      - name: Run smoke tests
+        run: |
+          # Test the application
+          sleep 10  # Wait for application to be fully ready
+
+          # Test via port-forward
+          kubectl port-forward service/flask-service 8080:80 &
+          sleep 5
+
+          # Test health endpoint
+          curl -f http://localhost:8080/health || exit 1
+          curl -f http://localhost:8080/ || exit 1
+          curl -f http://localhost:8080/config || exit 1
+
+      - name: Kubernetes status
+        run: |
+          echo "=== Pods ==="
+          kubectl get pods -o wide
+          echo ""
+          echo "=== Services ==="
+          kubectl get services
+          echo ""
+          echo "=== Ingress ==="
+          kubectl get ingress
+
+  # Security scanning
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: "fs"
+          scan-ref: "."
+          format: "sarif"
+          output: "trivy-results.sarif"
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: "trivy-results.sarif"

@@ -2,8 +2,10 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: flask-app
+  labels:
+    app: flask-app
 spec:
-  replicas: 2
+  replicas: 3
   selector:
     matchLabels:
       app: flask-app
@@ -18,18 +20,105 @@ spec:
           ports:
             - containerPort: 5000
           env:
-            - name: FLASK_ENV
-              value: "production"
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: flask-service
-spec:
-  selector:
-    app: flask-app
-  ports:
-    - protocol: TCP
-      port: 80
-      targetPort: 5000
-  type: LoadBalancer
+            # Environment variables from ConfigMap
+            - name: APP_NAME
+              valueFrom:
+                configMapKeyRef:
+                  name: flask-app-config
+                  key: APP_NAME
+            - name: ENVIRONMENT
+              valueFrom:
+                configMapKeyRef:
+                  name: flask-app-config
+                  key: ENVIRONMENT
+            - name: DEBUG
+              valueFrom:
+                configMapKeyRef:
+                  name: flask-app-config
+                  key: DEBUG
+            - name: LOG_LEVEL
+              valueFrom:
+                configMapKeyRef:
+                  name: flask-app-config
+                  key: LOG_LEVEL
+            - name: MAX_CONTENT_LENGTH
+              valueFrom:
+                configMapKeyRef:
+                  name: flask-app-config
+                  key: MAX_CONTENT_LENGTH
+
+            # Environment variables from Secret
+            - name: SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: flask-app-secrets
+                  key: secret-key
+
+            # Database URL (option 1: full URL from secret)
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: flask-app-secrets
+                  key: database-url
+
+            # Alternative database configuration (option 2: build URL from parts)
+            - name: DATABASE_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: flask-app-secrets
+                  key: db-username
+            - name: DATABASE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: flask-app-secrets
+                  key: db-password
+            - name: DATABASE_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: flask-app-secrets
+                  key: db-host
+            - name: DATABASE_PORT
+              valueFrom:
+                secretKeyRef:
+                  name: flask-app-secrets
+                  key: db-port
+            - name: DATABASE_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: flask-app-secrets
+                  key: db-name
+
+            # Build DATABASE_URL from parts if not set directly
+            - name: DATABASE_URL
+              value: "postgresql://$(DATABASE_USERNAME):$(DATABASE_PASSWORD)@$(DATABASE_HOST):$(DATABASE_PORT)/$(DATABASE_NAME)"
+
+          volumeMounts:
+            - name: config-volume
+              mountPath: /app/config
+              readOnly: true
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "200m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: config-volume
+          configMap:
+            name: flask-app-config
+            items:
+              - key: app-config.yaml
+                path: app-config.yaml

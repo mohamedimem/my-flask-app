@@ -1,4 +1,4 @@
-from flask import render_template, request, redirect
+from flask import render_template, request, redirect, jsonify
 from app import app, db
 from app.models import Entry
 
@@ -89,3 +89,33 @@ def turn(id):
 # @app.errorhandler(Exception)
 # def error_page(e):
 #     return "of the jedi"
+
+
+@app.route('/config')
+def show_config():
+    # Don't expose sensitive information in production!
+    config_info = {
+        'app_name': app.config['APP_NAME'],
+        'environment': app.config['ENVIRONMENT'],
+        'debug': app.config['DEBUG'],
+        'log_level': app.config['LOG_LEVEL'],
+        'database_configured': bool(app.config['SQLALCHEMY_DATABASE_URI']),
+        'max_content_length': app.config['MAX_CONTENT_LENGTH']
+    }
+    return jsonify(config_info)
+
+
+
+@app.route('/health')
+def health():
+    db_status = 'connected'
+    try:
+        db.engine.execute('SELECT 1')
+    except:
+        db_status = 'disconnected'
+    
+    return jsonify({
+        'status': 'healthy',
+        'database': db_status,
+        'environment': app.config['ENVIRONMENT']
+    })
